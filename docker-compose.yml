@@ -18,6 +18,8 @@ x-common-env: &common-env
   GATEWAY_MAX_DELAY: "5.0"
   WEBHOOK_RETRY_ATTEMPTS: "3"
   WEBHOOK_RETRY_BACKOFF: "2.0"
+  CONSUMER_RETRY_ATTEMPTS: "3"
+  CONSUMER_RETRY_BACKOFF: "2.0"
 
 services:
   postgres:
@@ -47,13 +49,25 @@ services:
       - rabbitmq_data:/var/lib/rabbitmq
     ports:
       - "5672:5672"
-      - "15672:15672"   # Management UI
+      - "15672:15672"   # Management UI: http://localhost:15672
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
       timeout: 10s
       retries: 10
       start_period: 30s
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: alembic upgrade head
+    environment:
+      <<: *common-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   api:
     build:
@@ -68,6 +82,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
       interval: 10s
@@ -87,6 +103,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: on-failure
 
 volumes:

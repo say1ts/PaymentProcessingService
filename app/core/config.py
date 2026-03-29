@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     environment: str = "development"
 
-    outbox_poll_interval: float = 1.0  # seconds
+    outbox_poll_interval: float = 1.0
 
     gateway_success_rate: float = 0.9
     gateway_min_delay: float = 2.0
@@ -33,6 +33,9 @@ class Settings(BaseSettings):
 
     webhook_retry_attempts: int = 3
     webhook_retry_backoff: float = 2.0
+
+    consumer_retry_attempts: int = 3
+    consumer_retry_backoff: float = 2.0
 
     @field_validator("api_key")
     @classmethod

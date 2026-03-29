@@ -17,6 +17,7 @@ from app.infra.db.session import get_session
 _engine = None
 _sessionmaker = None
 
+
 @pytest.fixture(scope="session", autouse=True)
 async def setup_database():
     global _engine, _sessionmaker
@@ -27,32 +28,37 @@ async def setup_database():
         if not res.scalar():
             await conn.execute(text("CREATE DATABASE payments_test"))
     await admin_engine.dispose()
+
     _engine = create_async_engine(os.getenv("DATABASE_URL"))
     _sessionmaker = async_sessionmaker(bind=_engine, expire_on_commit=False)
 
     async with _engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
-    
+
     yield
-    
+
     await _engine.dispose()
+
 
 @pytest.fixture
 async def db_session() -> AsyncGenerator[AsyncSession]:
     """Чистая сессия для каждого теста с откатом."""
-    async with _sessionmaker() as session: # type: ignore
+    async with _sessionmaker() as session:  # type: ignore
         yield session
         await session.rollback()
+
 
 @pytest.fixture
 async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient]:
     """Клиент, который прокидывает тестовую сессию и мокает API-ключ."""
     app.dependency_overrides[get_session] = lambda: db_session
+
     async def mock_verify_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
         if x_api_key != "dev_secret_key_change_in_production":
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, 
-                detail="Invalid API Key"
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid API Key",
             )
         return x_api_key
 
@@ -63,4 +69,3 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient]:
         yield ac
 
     app.dependency_overrides.clear()
-    

@@ -13,8 +13,7 @@ async def get_payment_by_id(
     session: AsyncSession,
     payment_id: uuid.UUID,
 ) -> PaymentModel | None:
-    result = await session.get(PaymentModel, payment_id)
-    return result
+    return await session.get(PaymentModel, payment_id)
 
 
 async def get_payment_by_idempotency_key(
@@ -29,7 +28,7 @@ async def get_payment_by_idempotency_key(
 async def insert_payment(session: AsyncSession, payment: PaymentModel) -> None:
     """Добавляет payment в сессию. Коммит — на вызывающей стороне."""
     session.add(payment)
-    await session.flush()  # получаем id сразу, без коммита
+    await session.flush()
 
 
 async def update_payment_status(
@@ -51,6 +50,25 @@ async def update_payment_status(
         .values(**values)
     )
     await session.execute(stmt)
+
+
+async def increment_consumer_attempts(
+    session: AsyncSession,
+    payment_id: uuid.UUID,
+) -> int:
+    """
+    Атомарно инкрементирует consumer_attempts и возвращает новое значение.
+    Коммит вызывается внутри — операция должна быть изолирована от основной транзакции.
+    """
+    stmt = (
+        update(PaymentModel)
+        .where(PaymentModel.id == payment_id)
+        .values(consumer_attempts=PaymentModel.consumer_attempts + 1)
+        .returning(PaymentModel.consumer_attempts)
+    )
+    result = await session.execute(stmt)
+    await session.commit()
+    return result.scalar_one()
 
 
 async def insert_outbox_event(session: AsyncSession, event: OutboxEventModel) -> None:
@@ -107,3 +125,4 @@ async def mark_outbox_failed(session: AsyncSession, event_id: uuid.UUID) -> None
             .where(OutboxEventModel.id == event_id)
             .values(status="failed")
         )
+        
