@@ -2,152 +2,389 @@
 
 Асинхронный микросервис обработки платежей на FastAPI + RabbitMQ + PostgreSQL.
 
+
+
+## Быстрый старт
+
+### Предварительные требования
+
+- Docker 24+
+- Docker Compose v2
+
+### Запуск
+
+```bash
+# Клонировать репозиторий
+git clone https://github.com/say1ts/PaymentProcessingService
+cd PaymentProcessingService
+
+# Запустить все сервисы (postgres, rabbitmq, migrate, api, consumer)
+docker compose up --build
+```
+
+Сервисы стартуют в правильном порядке:
+1. `postgres` и `rabbitmq` — ждут healthcheck
+2. `migrate` — применяет миграции Alembic и завершается
+3. `api` и `consumer` — стартуют после успешной миграции
+
+**API доступно:** `http://localhost:8000`  
+**Swagger UI:** `http://localhost:8000/docs`  
+**RabbitMQ Management:** `http://localhost:15672` (логин: `payments` / `payments_secret`)
+
+### Остановка
+
+```bash
+docker compose down          # остановить контейнеры
+docker compose down -v       # + удалить volumes (БД и очереди)
+```
+
+---
+
+
+
+## Тесты
+
+Для тестов нужен запущенный PostgreSQL (RabbitMQ не требуется — брокер не используется в тестах).
+
+```bash
+# Поднять только БД
+docker compose up postgres -d
+
+# Запустить тесты
+pytest tests/ -v
+```
+
+```
+tests/test_payments.py::TestPaymentsAPI::test_create_payment_success        PASSED
+tests/test_payments.py::TestPaymentsAPI::test_create_payment_idempotency    PASSED
+tests/test_payments.py::TestPaymentsAPI::test_get_payment_details           PASSED
+tests/test_payments.py::TestPaymentsAPI::test_create_payment_validation_error PASSED
+tests/test_payments.py::TestPaymentsAPI::test_unauthorized_access           PASSED
+tests/test_payments.py::TestPaymentsAPI::test_get_non_existent_payment      PASSED
+```
+
+---
+
 ## Архитектура
 
 ```
-POST /api/v1/payments
-        │
-        ▼
-  [API] INSERT payments + outbox_events  ← одна транзакция
-        │
-        ▼
-  [OutboxPoller] SELECT FOR UPDATE SKIP LOCKED
-        │
-        ▼
-  [RabbitMQ] payments.exchange → payments.new
-        │
-        ▼
-  [Consumer] GatewayEmulator (2-5s, 90% success)
-        │
-        ├─ Ok  → UPDATE status=succeeded → webhook
-        └─ Err → UPDATE status=failed   → webhook
-                              │
-                         3 nack → DLX → payments.dead
+┌─────────────┐    POST /payments     ┌─────────────────┐
+│   Client    │──────────────────────▶│   FastAPI API   │
+└─────────────┘                       └────────┬────────┘
+                                               │ 1. Сохранить Payment (pending)
+                                               │ 2. Сохранить OutboxEvent
+                                               │    (одна транзакция)
+                                               ▼
+                                       ┌──────────────┐
+                                       │  PostgreSQL  │
+                                       └──────┬───────┘
+                                              │
+                                    ┌─────────▼─────────┐
+                                    │  Outbox Poller    │
+                                    │  (раз в 1 сек)    │
+                                    └─────────┬─────────┘
+                                              │ publish event
+                                              ▼
+                                    ┌──────────────────┐
+                                    │    RabbitMQ      │
+                                    │  payments.new    │──── (nack x3) ──▶ payments.dead
+                                    └────────┬─────────┘                    (DLQ)
+                                             │
+                                    ┌────────▼─────────┐
+                                    │    Consumer      │
+                                    │  1. Gateway эмул │
+                                    │  2. UPDATE status│
+                                    │  3. Webhook POST │
+                                    └──────────────────┘
 ```
 
-## Запуск
+**Гарантии доставки:**
+- **Outbox pattern** — событие и платёж сохраняются атомарно в одной транзакции. Даже при падении сервиса до публикации в брокер, поллер подберёт необработанные события.
+- **Idempotency key** — повторный запрос с тем же ключом возвращает тот же платёж без дублирования.
+- **Retry с экспоненциальной задержкой** — 3 попытки: 1s → 2s → 4s. Счётчик хранится в БД, переживает перезапуск consumer-а.
+- **DLQ** — после 3 неудачных попыток сообщение уходит в `payments.dead` через `x-dead-letter-exchange`.
+
+---
+
+## Стек
+
+| Компонент | Технология |
+|---|---|
+| API | FastAPI 0.115 + Pydantic v2 |
+| ORM | SQLAlchemy 2.0 (async) |
+| БД | PostgreSQL 16 |
+| Брокер | RabbitMQ 3.13 (FastStream + aio-pika) |
+| Миграции | Alembic |
+| Логирование | structlog (JSON в prod, цветной вывод в dev) |
+| Контейнеризация | Docker + docker-compose |
+
+---
+
+## Локальная разработка
+
+### Требования
+
+- Python 3.13+
+- [uv](https://docs.astral.sh/uv/) (или pip)
+- PostgreSQL и RabbitMQ (можно поднять только инфраструктуру через Docker)
+
+### Установка зависимостей
 
 ```bash
-# 1. Клонировать и перейти в директорию
-cp .env.example .env
-
-# 2. Поднять все сервисы
-docker-compose up --build
-
-# 3. Проверить что всё поднялось
-curl http://localhost:8000/health
+uv sync --dev
 ```
 
-RabbitMQ Management UI: http://localhost:15672  
-Логин: `payments` / `payments_secret`
+### Поднять только инфраструктуру
+
+```bash
+docker compose up postgres rabbitmq -d
+```
+
+### Переменные окружения
+
+Создайте файл `.env` в корне проекта:
+
+```env
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_USER=payments
+POSTGRES_PASSWORD=payments_secret
+POSTGRES_DB=payments
+
+RABBITMQ_HOST=localhost
+RABBITMQ_PORT=5672
+RABBITMQ_USER=payments
+RABBITMQ_PASSWORD=payments_secret
+RABBITMQ_VHOST=/
+
+API_KEY=dev_secret_key_change_in_production
+LOG_LEVEL=INFO
+ENVIRONMENT=development
+```
+
+### Применить миграции
+
+```bash
+alembic upgrade head
+```
+
+### Запустить API
+
+```bash
+uvicorn app.api.main:app --reload --port 8000
+```
+
+### Запустить Consumer
+
+```bash
+python -m consumer.main
+```
+
+---
 
 ## API
 
+Все эндпоинты требуют заголовок `X-API-Key`.
+
 ### Создать платёж
 
-```bash
-curl -X POST http://localhost:8000/api/v1/payments \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev_secret_key_change_in_production" \
-  -H "Idempotency-Key: unique-key-001" \
-  -d '{
-    "amount": "100.00",
-    "currency": "RUB",
-    "description": "Оплата заказа #42",
-    "metadata": {"order_id": 42},
-    "webhook_url": "https://webhook.site/your-unique-id"
-  }'
+```
+POST /api/v1/payments
+X-API-Key: <key>
+Idempotency-Key: <uuid>
+Content-Type: application/json
 ```
 
-**Ответ 202:**
+**Тело запроса:**
+
 ```json
 {
-  "payment_id": "a1b2c3d4-...",
-  "status": "pending",
-  "created_at": "2024-01-01T12:00:00Z"
+  "amount": 1500.00,
+  "currency": "RUB",
+  "description": "Оплата заказа #42",
+  "webhook_url": "https://your-service.example.com/webhook",
+  "metadata": {
+    "order_id": "42",
+    "user_id": "123"
+  }
 }
 ```
+
+**Ответ `202 Accepted`:**
+
+```json
+{
+  "payment_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "status": "pending",
+  "created_at": "2024-01-15T12:00:00.000000Z"
+}
+```
+
+**Возможные ошибки:**
+
+| Код | Причина |
+|-----|---------|
+| `401` | Отсутствует или неверный `X-API-Key` |
+| `422` | Ошибка валидации (отрицательная сумма, неверная валюта и т.д.) |
+
+---
 
 ### Получить платёж
 
-```bash
-curl http://localhost:8000/api/v1/payments/a1b2c3d4-... \
-  -H "X-API-Key: dev_secret_key_change_in_production"
+```
+GET /api/v1/payments/{payment_id}
+X-API-Key: <key>
 ```
 
-**Ответ 200:**
+**Ответ `200 OK`:**
+
 ```json
 {
-  "id": "a1b2c3d4-...",
-  "amount": "100.00",
+  "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "amount": "1500.00",
   "currency": "RUB",
   "description": "Оплата заказа #42",
-  "metadata": {"order_id": 42},
+  "metadata": { "order_id": "42" },
   "status": "succeeded",
-  "idempotency_key": "unique-key-001",
-  "webhook_url": "https://webhook.site/...",
+  "idempotency_key": "550e8400-e29b-41d4-a716-446655440000",
+  "webhook_url": "https://your-service.example.com/webhook",
   "failure_reason": null,
-  "created_at": "2024-01-01T12:00:00Z",
-  "processed_at": "2024-01-01T12:00:04Z"
+  "created_at": "2024-01-15T12:00:00.000000Z",
+  "processed_at": "2024-01-15T12:00:04.123456Z"
 }
 ```
 
-### Идемпотентность
+**Возможные статусы:** `pending` → `succeeded` | `failed`
 
-Повторный запрос с тем же `Idempotency-Key` вернёт **тот же платёж** без дублирования:
+**Возможные ошибки:**
 
-```bash
-# Второй запрос с тем же ключом → 202 + тот же payment_id
-curl -X POST http://localhost:8000/api/v1/payments \
-  -H "Idempotency-Key: unique-key-001" \
-  ...
+| Код | Причина |
+|-----|---------|
+| `401` | Отсутствует или неверный `X-API-Key` |
+| `404` | Платёж не найден |
+
+---
+
+### Healthcheck
+
+```
+GET /health
 ```
 
-## Ключевые решения
+```json
+{ "status": "ok" }
+```
 
-| Паттерн | Реализация |
-|---|---|
-| Outbox | `payments` + `outbox_events` в одной транзакции |
-| Polling | `SELECT FOR UPDATE SKIP LOCKED` — безопасен для нескольких экземпляров |
-| Идемпотентность | `UNIQUE` индекс на `idempotency_key` + декоратор `@idempotent` |
-| DLQ | `x-dead-letter-exchange` на очереди → `payments.dlx` → `payments.dead` |
-| Retry webhook | Замыкание `with_retry(attempts=3, backoff=2.0)` |
-| Lifecycle | FastAPI `lifespan` + `asyncio.Task` для poller |
-| Logging | `structlog` с контекстом `payment_id` в каждой записи |
+---
+
+## Webhook-уведомления
+
+После обработки платежа consumer отправляет `POST`-запрос на `webhook_url`.
+
+**Успешный платёж:**
+
+```json
+{
+  "event": "payment.succeeded",
+  "payment_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "transaction_id": "tx_a1b2c3d4e5f67890",
+  "timestamp": "2024-01-15T12:00:04.123456+00:00"
+}
+```
+
+**Неудачный платёж:**
+
+```json
+{
+  "event": "payment.failed",
+  "payment_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "failure_reason": "Insufficient funds",
+  "timestamp": "2024-01-15T12:00:07.654321+00:00"
+}
+```
+
+Webhook отправляется с retry: 3 попытки с экспоненциальной задержкой (1s, 2s, 4s). Локальные и приватные IP-адреса блокируются (SSRF-защита).
+
+---
 
 ## Структура проекта
 
 ```
-app/
-  core/         # config.py, logging.py
-  domain/       # value_objects.py, events.py, result.py  ← нет infra импортов
-  infra/
-    db/         # models.py, session.py, repositories.py
-    broker/     # publisher.py, topology.py
-    gateway/    # emulator.py
-    outbox/     # poller.py
-    webhook/    # sender.py
-  services/     # payments.py  ← бизнес-логика
-  api/v1/       # роутеры, схемы, deps
-consumer/       # отдельный процесс, не импортирует FastAPI
-alembic/        # миграции
+payments-service/
+├── app/
+│   ├── api/
+│   │   ├── main.py              # FastAPI приложение, lifespan
+│   │   ├── deps.py              # Зависимости: API-ключ, сессия БД
+│   │   └── v1/
+│   │       ├── payments.py      # Эндпоинты
+│   │       └── schemas.py       # Pydantic-схемы запроса/ответа
+│   ├── core/
+│   │   ├── config.py            # Настройки через pydantic-settings
+│   │   └── logging.py           # structlog (JSON / dev-консоль)
+│   ├── domain/
+│   │   ├── events.py            # Доменные события (PaymentCreated и др.)
+│   │   ├── result.py            # Result type: Ok[T] | Err
+│   │   └── value_objects.py     # Money, Currency
+│   ├── infra/
+│   │   ├── broker/
+│   │   │   ├── publisher.py     # RabbitMQ publisher (aio-pika)
+│   │   │   └── topology.py      # FastStream объекты для subscriber
+│   │   ├── db/
+│   │   │   ├── models.py        # SQLAlchemy ORM-модели
+│   │   │   ├── repositories.py  # Функции доступа к данным
+│   │   │   └── session.py       # Engine и session factory
+│   │   ├── gateway/
+│   │   │   └── emulator.py      # Эмуляция платёжного шлюза (2-5s, 90%/10%)
+│   │   ├── outbox/
+│   │   │   └── poller.py        # Outbox poller (SELECT FOR UPDATE SKIP LOCKED)
+│   │   └── webhook/
+│   │       └── sender.py        # HTTP-отправка с retry и SSRF-защитой
+│   └── services/
+│       └── payments.py          # Бизнес-логика: create_payment, get_payment
+├── consumer/
+│   ├── main.py                  # FastStream app, объявление топологии RabbitMQ
+│   └── handler.py               # Обработчик сообщения: gateway → DB → webhook
+├── alembic/
+│   ├── env.py
+│   └── versions/
+│       ├── 0001_initial.py      # Таблицы payments и outbox_events
+│       └── 0002_consumer_attempts.py  # Счётчик попыток consumer-а
+├── tests/
+│   ├── conftest.py              # Фикстуры: тестовая БД, HTTP-клиент
+│   └── test_payments.py         # Интеграционные тесты API
+├── Dockerfile.api
+├── Dockerfile.consumer
+├── docker-compose.yml
+├── pyproject.toml
+└── .env                         # (не коммитить)
 ```
 
-## Локальная разработка
+---
 
-```bash
-# Установить зависимости
-pip install poetry && poetry install
+## Конфигурация
 
-# Только инфраструктура
-docker-compose up postgres rabbitmq
+Все параметры задаются через переменные окружения или файл `.env`.
 
-# Применить миграции
-alembic upgrade head
-
-# API
-uvicorn app.api.main:app --reload
-
-# Consumer (в другом терминале)
-python -m consumer.main
-```
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `API_KEY` | — | **Обязательно.** Статический API-ключ |
+| `POSTGRES_HOST` | `localhost` | Хост PostgreSQL |
+| `POSTGRES_PORT` | `5432` | Порт PostgreSQL |
+| `POSTGRES_USER` | `postgres` | Пользователь БД |
+| `POSTGRES_PASSWORD` | `postgres` | Пароль БД |
+| `POSTGRES_DB` | `payments` | Имя базы данных |
+| `RABBITMQ_HOST` | `localhost` | Хост RabbitMQ |
+| `RABBITMQ_PORT` | `5672` | Порт AMQP |
+| `RABBITMQ_USER` | `guest` | Пользователь RabbitMQ |
+| `RABBITMQ_PASSWORD` | `guest` | Пароль RabbitMQ |
+| `RABBITMQ_VHOST` | `/` | Virtual host |
+| `ENVIRONMENT` | `development` | `development` или `production` |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `OUTBOX_POLL_INTERVAL` | `1.0` | Интервал поллера в секундах |
+| `GATEWAY_SUCCESS_RATE` | `0.9` | Вероятность успеха шлюза (0.0–1.0) |
+| `GATEWAY_MIN_DELAY` | `2.0` | Минимальная задержка шлюза (сек) |
+| `GATEWAY_MAX_DELAY` | `5.0` | Максимальная задержка шлюза (сек) |
+| `WEBHOOK_RETRY_ATTEMPTS` | `3` | Попыток отправки webhook |
+| `WEBHOOK_RETRY_BACKOFF` | `2.0` | База для экспоненциального backoff webhook |
+| `CONSUMER_RETRY_ATTEMPTS` | `3` | Попыток обработки сообщения consumer-ом |
+| `CONSUMER_RETRY_BACKOFF` | `2.0` | База для экспоненциального backoff consumer-а |
