@@ -1,21 +1,13 @@
-"""
-Alembic env.py — поддерживает и online (async), и offline режимы.
-
-Async миграции через run_sync:
-  asyncio.run(run_async_migrations())
-
-Модели импортируются через Base.metadata — Alembic видит все таблицы.
-"""
 from __future__ import annotations
 
 import asyncio
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+from alembic import context
 from app.core.config import settings
 from app.infra.db.models import Base
 

@@ -62,6 +62,9 @@ services:
       context: .
       dockerfile: Dockerfile.api
     command: alembic upgrade head
+    volumes:
+      - .:/app
+      - /app/.venv
     environment:
       <<: *common-env
     depends_on:

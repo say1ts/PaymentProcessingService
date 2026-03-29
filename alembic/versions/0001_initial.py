@@ -1,10 +1,3 @@
-"""initial: create payments and outbox_events tables
-
-Revision ID: 0001_initial
-Revises:
-Create Date: 2024-01-01 00:00:00.000000
-"""
-
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
