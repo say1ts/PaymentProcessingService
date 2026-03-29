@@ -1,0 +1,36 @@
+FROM python:3.13-slim
+
+# Копируем uv из официального образа
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Системные либы для работы с БД
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Настройки как в примере astral-sh
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    # Добавляем виртуальное окружение в PATH — ЭТО КРИТИЧНО
+    PATH="/app/.venv/bin:$PATH"
+
+# 1. Устанавливаем зависимости (используем кеш для ускорения)
+# Флаг --no-install-project важен, так как кода еще нет
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --no-dev --no-install-project
+
+# 2. Копируем проект
+COPY . .
+
+# 3. Финальная синхронизация (без сборки пакета, если в pyproject нет спец-настроек)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+
+# Теперь alembic и uvicorn будут доступны напрямую
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.api.main:app --host 0.0.0.0 --port 8000"]
